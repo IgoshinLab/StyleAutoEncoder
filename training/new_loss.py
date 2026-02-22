@@ -11,6 +11,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import upfirdn2d
@@ -42,7 +43,7 @@ class Loss:
 class StyleGAN2Loss(Loss):
     def __init__(self, device, G, D, E, augment_pipe=None, r1_gamma=10, style_mixing_prob=0, pl_weight=0,
                  pl_batch_shrink=2, pl_decay=0.01, pl_no_weight_grad=False, blur_init_sigma=0, blur_fade_kimg=0,
-                 kld_weight=0.02, total_steps=10000, increment_step=1000):
+                 kld_weight=0.02, total_steps=10000, increment_step=1000, noise_mode='random'):
         super().__init__()
         self.device = device
         self.G = G
@@ -60,6 +61,7 @@ class StyleGAN2Loss(Loss):
         self.blur_fade_kimg = blur_fade_kimg
         self.triplet_loss = nn.TripletMarginLoss(margin=0.1, p=2)
         self.kld_weight = kld_weight
+        self.noise_mode = noise_mode
 
     def run_G(self, z, c, update_emas=False):
         ws = self.G.mapping(z, c, update_emas=update_emas)
@@ -69,7 +71,7 @@ class StyleGAN2Loss(Loss):
                 cutoff = torch.where(torch.rand([], device=ws.device) < self.style_mixing_prob, cutoff,
                                      torch.full_like(cutoff, ws.shape[1]))
                 ws[:, cutoff:] = self.G.mapping(torch.randn_like(z), c, update_emas=False)[:, cutoff:]
-        img = self.G.synthesis(ws, update_emas=update_emas)
+        img = self.G.synthesis(ws, update_emas=update_emas, noise_mode=self.noise_mode)
         return img, ws
 
     def run_E(self, img, c, blur_sigma=0, update_emas=False):
@@ -170,23 +172,6 @@ class StyleGAN2Loss(Loss):
                                                                                               [real_c, real_c],
                                                                                               blur_sigma=blur_sigma)
                 training_stats.report(f'{state}_Loss/scores/fake', gen_logits)
-                # training_stats.report('Loss/signs/fake', gen_logits.sign())
-
-                ## Feature matching loss
-                # feat_match = self.D.feature_matching([real_img1, gen_img], [real_c, real_c]).mean()
-                # training_stats.report('Loss/G/feat_match', feat_match)
-
-                ## The triplet loss
-                # gen_z2 = self.run_E(real_img2, real_c)
-                # fake_z = self.run_E(gen_img.detach(), real_c)
-                # triplet = self.triplet_loss(gen_z, gen_z2, fake_z)
-                # training_stats.report('Loss/E/triplet_loss', triplet)
-
-                # gen_z1 = self.D.triplet(real_img1, real_c)
-                # gen_z2 = self.D.triplet(real_img2, real_c)
-                # fake_z = self.D.triplet(gen_img, real_c)
-                # triplet = self.triplet_loss(gen_z1, gen_z2, fake_z)
-                # training_stats.report('Loss/E/triplet_loss', triplet)
 
                 '''Gradient penalty is not compatible with multiple GPUs at this time.'''
                 # (gradient_penalty, grad) = self.calc_gradient_penalty(real_img1, gen_img, real_img2)
@@ -194,10 +179,9 @@ class StyleGAN2Loss(Loss):
                 loss_Gmain = torch.nn.functional.softplus(-gen_logits)  # -log(sigmoid(gen_logits))
                 loss_Gconstraints = KLD_loss  # + gradient_penalty
                 training_stats.report(f'{state}_Loss/G/loss', loss_Gmain)
-                # training_stats.report('Loss/G/constraints', loss_Gconstraints)
 
-                compute_layerwise_l2_norm(self.E, 'E')
-                compute_layerwise_l2_norm(self.G, 'G')
+                # compute_layerwise_l2_norm(self.E, 'E')
+                # compute_layerwise_l2_norm(self.G, 'G')
             if state == "training":
                 with torch.autograd.profiler.record_function('Gmain_backward'):
                     loss_Gmain.mean().mul(gain).backward(retain_graph=True)
@@ -223,8 +207,8 @@ class StyleGAN2Loss(Loss):
                 loss_Gpl = pl_penalty * self.pl_weight
                 training_stats.report(f'{state}_Loss/G/reg', loss_Gpl)
 
-                compute_layerwise_l2_norm(self.E, 'E')
-                compute_layerwise_l2_norm(self.G, 'G')
+                # compute_layerwise_l2_norm(self.E, 'E')
+                # compute_layerwise_l2_norm(self.G, 'G')
             if state == "training":
                 with torch.autograd.profiler.record_function('Gpl_backward'):
                     loss_Gpl.mean().mul(gain).backward()
@@ -241,18 +225,10 @@ class StyleGAN2Loss(Loss):
                                                                                          blur_sigma=blur_sigma,
                                                                                          update_emas=True)
 
-                # gen_z1 = self.D.triplet(real_img1, real_c)
-                # gen_z2 = self.D.triplet(real_img2, real_c)
-                # fake_z = self.D.triplet(gen_img, real_c)
-                # triplet = self.triplet_loss(gen_z1, gen_z2, fake_z)
-                # training_stats.report('Loss/D/triplet_loss', triplet)
-
-                # training_stats.report('Loss/scores/fake', gen_logits)
-                # training_stats.report('Loss/signs/fake', gen_logits.sign())
                 loss_Dgen = torch.nn.functional.softplus(gen_logits)  # -log(1 - sigmoid(gen_logits))
                 training_stats.report(f'{state}_Loss/D/gen_loss', loss_Dgen)
 
-                compute_layerwise_l2_norm(self.D, 'D')
+                # compute_layerwise_l2_norm(self.D, 'D')
             if state == "training":
                 with torch.autograd.profiler.record_function('Dgen_backward'):
                     loss_Dgen.mean().mul(gain).backward()
@@ -268,13 +244,11 @@ class StyleGAN2Loss(Loss):
                                          blur_sigma=blur_sigma) if switch_flag else self.run_D(
                     [real_img1_tmp, real_img2_tmp], [real_c, real_c], blur_sigma=blur_sigma)
                 training_stats.report(f'{state}_Loss/scores/real', real_logits)
-                # training_stats.report('Loss/signs/real', real_logits.sign())
 
                 loss_Dreal = 0
                 if phase in ['Dmain', 'Dboth']:
                     loss_Dreal = torch.nn.functional.softplus(-real_logits)  # -log(sigmoid(real_logits))
                     training_stats.report(f'{state}_Loss/D/real_loss', loss_Dreal)
-                    # training_stats.report('Loss/D/loss', loss_Dgen + loss_Dreal)
 
                 loss_Dr1 = 0
                 if phase in ['Dreg', 'Dboth']:
@@ -294,7 +268,7 @@ class StyleGAN2Loss(Loss):
                     if state == "training":
                         gradient_penalty.backward()  # Include this in the backward pass
 
-                compute_layerwise_l2_norm(self.D, 'D')
+                # compute_layerwise_l2_norm(self.D, 'D')
             if state == "training":
                 with torch.autograd.profiler.record_function(name + '_backward'):
                     (loss_Dreal + loss_Dr1).mean().mul(gain).backward()

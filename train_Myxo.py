@@ -1,10 +1,14 @@
 import copy
-import os
-import click
-import re
 import json
+import os
+import re
 import tempfile
+
+import click
 import torch
+
+# Set TORCH_CUDA_ARCH_LIST to avoid warnings and ensure correct compilation
+os.environ['TORCH_CUDA_ARCH_LIST'] = '8.6'
 
 import dnnlib
 from training import new_training_loop
@@ -53,6 +57,8 @@ def launch_training(c, desc, outdir, dry_run):
     prev_run_dirs = []
     if os.path.isdir(outdir):
         prev_run_dirs = [x for x in os.listdir(outdir) if os.path.isdir(os.path.join(outdir, x))]
+    else:
+        os.makedirs(outdir, exist_ok=True)
     prev_run_ids = [re.match(r'^\d+', x) for x in prev_run_dirs]
     prev_run_ids = [int(x.group()) for x in prev_run_ids if x is not None]
     cur_run_id = max(prev_run_ids, default=-1) + 1
@@ -88,7 +94,10 @@ def launch_training(c, desc, outdir, dry_run):
 
     # Launch processes.
     print('Launching processes...')
-    torch.multiprocessing.set_start_method('spawn')
+    try:
+        torch.multiprocessing.set_start_method('spawn')
+    except RuntimeError:
+        pass
     with tempfile.TemporaryDirectory() as temp_dir:
         if c.num_gpus == 1:
             subprocess_fn(rank=0, c=c, temp_dir=temp_dir)
@@ -96,15 +105,22 @@ def launch_training(c, desc, outdir, dry_run):
             torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir), nprocs=c.num_gpus)
 
 
-def init_dataset_kwargs(data, label_dict, mode="random", brightness_norm=0.5):
+def init_dataset_kwargs(data, label_dict, resize_by=1., mode="random", brightness_norm=0.5, preload=False):
     try:
-        dataset_kwargs = dnnlib.EasyDict(class_name='dataloaders.PairedMyxo.PairedMyxo', resolution=512, resize_by=1.,
+        # Temporarily disable preloading for inspection.
+        dataset_kwargs = dnnlib.EasyDict(class_name='dataloaders.PairedMyxo.PairedMyxo', resolution=512,
+                                         resize_by=resize_by,
                                          path=data, use_labels=True, max_size=None, xflip=False, use_rgb=False,
-                                         mode=mode, label_dict=label_dict, brightness_norm=brightness_norm)
+                                         mode=mode, label_dict=label_dict, brightness_norm=brightness_norm,
+                                         preload=False)  # Always False for inspection
         dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)  # Subclass of training.dataset.Dataset.
         dataset_kwargs.resolution = dataset_obj.resolution  # Be explicit about resolution.
         dataset_kwargs.use_labels = dataset_obj.has_labels  # Be explicit about labels.
         dataset_kwargs.max_size = len(dataset_obj)  # Be explicit about dataset size.
+
+        # Restore the user's preload setting for the real dataset construction.
+        dataset_kwargs.preload = preload
+
         return dataset_kwargs, dataset_obj.name
     except IOError as err:
         raise click.ClickException(f'--data: {err}')
@@ -123,22 +139,30 @@ def parse_comma_separated_list(s):
 @click.command()
 # Required.
 @click.option('--outdir', help='Where to save the results', metavar='DIR',
-              default='/home/xavier/PycharmProjects/training-runs/test', required=True)
+              default='D:/Projects/DAE_project/test', required=True)
 @click.option('--cfg', help='Base configuration', default='stylegan2',
               type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2']), required=True)
 @click.option('--data', help='Training data', metavar='[ZIP|DIR]',
-              default="/home/xavier/Documents/dataset/Welch/trainingset2/trainingset2", type=str, required=True)
+              default="D:/Projects/DAE_project/dataset/Roy_training/examples", type=str, required=True)
 @click.option('--label-dict', help='The label dictionary',
-              default='/home/xavier/Documents/dataset/Welch/classification-v2024/classification_models/240430-001/movie_classification/training_dict.pkl',
-              type=str, required=True)
-@click.option('--validation-data', help='Validation data', metavar='[ZIP|DIR]', type=str)
-@click.option('--validation-label-dict', help='The label dictionary', type=str)
+              # default='/home/xavier/Documents/dataset/Welch/classification-v2024/classification_models/240430-001/movie_classification/training_dict.pkl',
+              type=str)
 @click.option('--gpus', help='Number of GPUs to use', metavar='INT', default=1, type=click.IntRange(min=1),
               required=True)
 @click.option('--batch', help='Total batch size', metavar='INT', default=4, type=click.IntRange(min=1), required=True)
 @click.option('--gamma', help='R1 regularization weight', metavar='FLOAT', default=10, type=click.FloatRange(min=0),
               required=True)
+@click.option('--kld-weight', help='The KLD loss weight', metavar='FLOAT', default=0.02, type=click.FloatRange(min=0),
+              required=True)
+@click.option('--brightness-norm', help='The ratio of brightness normalization.', metavar='FLOAT', default=0,
+              type=click.FloatRange(min=0), required=True)
+@click.option('--resize-by', help='The resize factor.', metavar='FLOAT', default=1.,
+              type=click.FloatRange(min=0), required=True)
+@click.option('--noise-mode', help='Noise mode for generator', type=click.Choice(['random', 'const', 'none']),
+              default='random', show_default=True)
 # Optional features.
+@click.option('--validation-data', help='Validation data', metavar='[ZIP|DIR]', type=str)
+@click.option('--validation-label-dict', help='The label dictionary', type=str)
 @click.option('--cond', help='Train conditional model', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--mirror', help='Enable dataset x-flips', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--aug', help='Augmentation mode', type=click.Choice(['noaug', 'ada', 'fixed']), default='noaug',
@@ -154,7 +178,7 @@ def parse_comma_separated_list(s):
 @click.option('--target', help='Target value for --aug=ada', metavar='FLOAT', type=click.FloatRange(min=0, max=1),
               default=0.6, show_default=True)
 @click.option('--batch-gpu', help='Limit batch size per GPU', metavar='INT', type=click.IntRange(min=1))
-@click.option('--z-dim', help='The z dimension', metavar='INT', type=click.IntRange(min=2), default=5,
+@click.option('--z-dim', help='The z dimension', metavar='INT', type=click.IntRange(min=2), default=13,
               show_default=True)
 @click.option('--cbase', help='Capacity multiplier', metavar='INT', type=click.IntRange(min=1), default=32768,
               show_default=True)
@@ -180,7 +204,15 @@ def parse_comma_separated_list(s):
 @click.option('--fp32', help='Disable mixed-precision', metavar='BOOL', type=bool, default=False, show_default=True)
 @click.option('--nobench', help='Disable cuDNN benchmarking', metavar='BOOL', type=bool, default=False,
               show_default=True)
-@click.option('--workers', help='DataLoader worker processes', metavar='INT', type=click.IntRange(min=1), default=8,
+@click.option('--workers', help='DataLoader worker processes', metavar='INT', type=click.IntRange(min=1), default=4,
+              show_default=True)
+@click.option('--preload', is_flag=True, help='Preload dataset to memory', default=False, show_default=True)
+@click.option('--calculate_training_metrics', is_flag=True, help='Whether to calculate metrics on training set',
+              default=False,
+              show_default=True)
+@click.option('--disable_calculate_validation_metrics', is_flag=True,
+              help='Whether to calculate metrics on validation set',
+              default=False,
               show_default=True)
 @click.option('-n', '--dry-run', help='Print training options and exit', is_flag=True)
 def main(**kwargs):
@@ -192,11 +224,15 @@ def main(**kwargs):
                                  mapping_kwargs=dnnlib.EasyDict(), epilogue_kwargs=dnnlib.EasyDict())
     c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.AdamW', betas=[0, 0.99], eps=1e-8)
     c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.AdamW', betas=[0, 0.99], eps=1e-8)
-    c.loss_kwargs = dnnlib.EasyDict(class_name='training.new_loss.StyleGAN2Loss')
+    c.loss_kwargs = dnnlib.EasyDict(class_name='training.new_loss.StyleGAN2Loss', kld_weight=opts.kld_weight,
+                                    noise_mode=opts.noise_mode)
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
 
     # Training set.
-    c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data, label_dict=opts.label_dict)
+    c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data, label_dict=opts.label_dict,
+                                                              brightness_norm=opts.brightness_norm,
+                                                              resize_by=opts.resize_by,
+                                                              preload=opts.preload)
     if opts.cond and not c.training_set_kwargs.use_labels:
         raise click.ClickException('--cond=True requires labels specified in dataset.json')
     c.training_set_kwargs.use_labels = opts.cond
@@ -208,7 +244,9 @@ def main(**kwargs):
         c.validation_data_loader_kwargs = dnnlib.EasyDict(pin_memory=False)
         c.validation_set_kwargs, validation_set_name = init_dataset_kwargs(data=opts.validation_data,
                                                                            label_dict=opts.validation_label_dict,
-                                                                           mode="lrcrop", brightness_norm=0)
+                                                                           mode="lrcrop", brightness_norm=0,
+                                                                           resize_by=opts.resize_by,
+                                                                           preload=opts.preload)
         if opts.cond and not c.validation_set_kwargs.use_labels:
             raise click.ClickException('--cond=True requires validation setlabels specified in dataset.json')
         c.validation_set_kwargs.use_labels = opts.cond
@@ -236,6 +274,14 @@ def main(**kwargs):
     c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
+    c.calculate_training_metrics = opts.calculate_training_metrics
+    c.calculate_validation_metrics = ~opts.disable_calculate_validation_metrics
+
+    if opts.preload:
+        print("Preloading enabled: forcing num_workers=0 to avoid pickling overhead.")
+        c.data_loader_kwargs.num_workers = 0
+        if hasattr(c, 'validation_data_loader_kwargs'):
+            c.validation_data_loader_kwargs.num_workers = 0
 
     # Sanity checks.
     if c.batch_size % c.num_gpus != 0:

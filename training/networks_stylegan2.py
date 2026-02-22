@@ -144,7 +144,7 @@ class Conv2dLayer(torch.nn.Module):
                  in_channels,  # Number of input channels.
                  out_channels,  # Number of output channels.
                  kernel_size,  # Width and height of the convolution kernel.
-                 bias=False,  # Apply additive bias before the activation function?
+                 bias=False,  # Apply additive bias before the activation function? # TODO: Is it useful?
                  activation='linear',  # Activation function: 'relu', 'lrelu', etc.
                  up=1,  # Integer upsampling factor.
                  down=1,  # Integer downsampling factor.
@@ -684,9 +684,12 @@ class MinibatchStdLayer(torch.nn.Module):
 
     def forward(self, x):
         N, C, H, W = x.shape
+        F = self.num_channels
+        if not self.training or N == 1:
+            zeros = torch.zeros((N, F, H, W), device=x.device, dtype=x.dtype)
+            return torch.cat([x, zeros], dim=1)
         with misc.suppress_tracer_warnings():  # as_tensor results are registered as constants
             G = torch.min(torch.as_tensor(self.group_size), torch.as_tensor(N)) if self.group_size is not None else N
-        F = self.num_channels
         c = C // F
 
         y = x.reshape(G, -1, F, c, H,

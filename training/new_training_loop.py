@@ -13,13 +13,12 @@ from tensorboardX import SummaryWriter
 
 import dnnlib
 import legacy
+from metrics import metric_main
 from torch_utils import misc
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import grid_sample_gradfix
 from torch_utils.vis import scatterBWImages
-
-from metrics import metric_main
 
 
 # ----------------------------------------------------------------------------
@@ -112,6 +111,80 @@ def calc_gradient_penalty(real_data, fake_data, conditional_data, D):
     return gradient_penalty, grad_norm
 
 
+def calculate_metrics_at_k_list(targets, candidates, k_list=[1, 5, 50, 200]):
+    """
+    Calculate MAP@K, Accuracy@K, and Recall@K at multiple K values.
+
+    Logic for one-to-one mapping:
+    1. Compute cosine similarity between targets and candidates.
+    2. For each target i, the only correct answer is candidate i.
+    3. Find the rank of candidate i in the sorted results for target i.
+    4. Metrics:
+       - MAP@K: 1/rank if rank <= K, else 0.
+       - Accuracy@K (Hit Rate): 1 if rank <= K, else 0.
+       - Recall@K: 1 if rank <= K, else 0 (identical to Accuracy for single GT).
+
+    Parameters:
+    - targets: torch.Tensor of shape [N, latent_dim]
+    - candidates: torch.Tensor of shape [N, latent_dim]
+    - k_list: List of integers specifying K values
+
+    Returns:
+    - results: Dictionary containing MAP, Accuracy, and Recall for each K
+    """
+
+    device = targets.device
+    N = targets.size(0)
+    max_k = min(max(k_list), N)
+
+    # 1. Feature Normalization for Cosine Similarity
+    targets = torch.nn.functional.normalize(targets, p=2, dim=1)
+    candidates = torch.nn.functional.normalize(candidates, p=2, dim=1)
+
+    # 2. Compute Similarity Matrix [N, N]
+    sim_matrix = torch.mm(targets, candidates.t())
+    # 3. Get Top-K indices
+    # Using topk is efficient for large N
+    _, indices = torch.topk(sim_matrix, k=max_k, dim=1, largest=True, sorted=True)
+
+    # 4. Locate the ground truth positions
+    # Since target i matches candidate i, the GT index is i
+    ground_truth_indices = torch.arange(N, device=device).view(-1, 1)
+
+    # hits shape: [N, max_k] (boolean)
+    hits = (indices == ground_truth_indices)
+
+    # 5. Extract ranks
+    hit_rows, hit_cols = torch.where(hits)
+
+    # ranks: 1-based position of the correct candidate, 0 if not in top-max_k
+    ranks = torch.zeros(N, device=device)
+    ranks[hit_rows] = hit_cols.float() + 1.0
+
+    results = {}
+    for k in k_list:
+        if k > N:
+            continue
+        # Boolean mask for hits within top K
+        is_hit = (ranks > 0) & (ranks <= k)
+        hit_float = is_hit.float()
+
+        # Accuracy@K & Recall@K (equivalent in 1-to-1 mapping)
+        acc_at_k = hit_float.mean().item()
+        recall_at_k = acc_at_k
+
+        # MAP@K
+        ap_scores = torch.zeros(N, device=device)
+        ap_scores[is_hit] = 1.0 / ranks[is_hit]
+        map_at_k = ap_scores.mean().item()
+
+        results[f"Acc@{k}"] = acc_at_k
+        results[f"Recall@{k}"] = recall_at_k
+        results[f"MAP@{k}"] = map_at_k
+
+    return results
+
+
 def training_loop(
         run_dir='.',  # Output directory.
         citers=3,  # Train the D for citers in each epoch.
@@ -152,6 +225,10 @@ def training_loop(
         # Callback function for determining whether to abort training. Must return consistent results across ranks.
         progress_fn=None,  # Callback function for updating training progress. Called for all ranks.
         record_adam=False,  # The flag for recording adam mean and variation
+        calculate_training_metrics=False,
+        # The flag for whether calculating metrics MAP@k, Accuracy@k, and Recall@k on training set
+        calculate_validation_metrics=True,
+        # The flag for whether calculating metrics MAP@k, Accuracy@k, and Recall@k on validation set
 ):
     # Initialize.
     start_time = time.time()
@@ -174,15 +251,18 @@ def training_loop(
                                                              batch_size=batch_size // num_gpus, **data_loader_kwargs))
 
     # Load validation set
+    validation_set_iterator = None
     if validation_set_kwargs:
         if rank == 0:
             print("Loading validation set...")
         validation_set = dnnlib.util.construct_class_by_name(
             **validation_set_kwargs)  # subclass of training.dataset.Dataset
-        validation_set_loader = torch.utils.data.DataLoader(dataset=validation_set, batch_size=batch_size // num_gpus,
-                                                            **validation_data_loader_kwargs)
-    else:
-        validation_set_loader = None
+        validation_set_sampler = misc.InfiniteSampler(dataset=validation_set, rank=rank, num_replicas=num_gpus,
+                                                      seed=random_seed)
+        validation_set_iterator = iter(
+            torch.utils.data.DataLoader(dataset=validation_set, sampler=validation_set_sampler,
+                                        batch_size=batch_size // num_gpus,
+                                        **validation_data_loader_kwargs))
 
     if rank == 0:
         print()
@@ -300,8 +380,10 @@ def training_loop(
         else:
             grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
         grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
-        images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-        save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1, 1], grid_size=grid_size)
+        for noise_mode in ['const', 'random', 'none']:
+            images = torch.cat([G_ema(z=z, c=c, noise_mode=noise_mode).cpu() for z, c in zip(grid_z, grid_c)]).numpy()
+            save_image_grid(images, os.path.join(run_dir, f'fakes_init_{noise_mode}.png'), drange=[-1, 1],
+                            grid_size=grid_size)
 
     # Initialize logs.
     if rank == 0:
@@ -352,8 +434,7 @@ def training_loop(
 
             with torch.autograd.profiler.record_function('data_fetch'):
                 phase_real_img1, phase_real_img2, phase_real_c = next(training_set_iterator)
-                phase_real_img1 = phase_real_img1.to(device).to(torch.float32).split(
-                    batch_gpu)
+                phase_real_img1 = phase_real_img1.to(device).to(torch.float32).split(batch_gpu)
                 phase_real_img2 = phase_real_img2.to(device).to(torch.float32).split(batch_gpu)
                 phase_real_c = phase_real_c.to(device).split(batch_gpu)
 
@@ -362,6 +443,28 @@ def training_loop(
             for module_i in phase.module:
                 module_i.requires_grad_(True)
             for real_img1, real_img2, real_c in zip(phase_real_img1, phase_real_img2, phase_real_c):
+                # Calculate stats on training set.
+                if calculate_training_metrics and (
+                        cur_tick == 0 or (cur_nimg + batch_size >= tick_start_nimg + kimg_per_tick * 1000)):
+                    with torch.no_grad():
+                        t_mu1, _ = E.mu_var(real_img1, None)
+                        t_mu2, _ = E.mu_var(real_img2, None)
+
+                        if num_gpus > 1:
+                            t_mu1_list = [torch.zeros_like(t_mu1) for _ in range(num_gpus)]
+                            t_mu2_list = [torch.zeros_like(t_mu2) for _ in range(num_gpus)]
+                            torch.distributed.all_gather(t_mu1_list, t_mu1)
+                            torch.distributed.all_gather(t_mu2_list, t_mu2)
+                            t_mu1 = torch.cat(t_mu1_list, dim=0)
+                            t_mu2 = torch.cat(t_mu2_list, dim=0)
+
+                        t_ret_metrics = calculate_metrics_at_k_list(t_mu1, t_mu2, k_list=[1, 5, 50, 200])
+                        for m_n, m_v in t_ret_metrics.items():
+                            training_stats.report(f'train_eval_Metrics/{m_n}', m_v)
+                        del t_mu1, t_mu2, t_ret_metrics
+                        if num_gpus > 1:
+                            del t_mu1_list, t_mu2_list
+                        torch.cuda.empty_cache()
                 loss.accumulate_gradients(phase=phase.name, real_img1=real_img1, real_img2=real_img2,
                                           real_c=real_c,
                                           gain=phase.interval, cur_nimg=cur_nimg)
@@ -380,7 +483,7 @@ def training_loop(
                     if num_gpus > 1:
                         torch.distributed.all_reduce(flat)
                         flat /= num_gpus
-                    misc.nan_to_num(flat, nan=0, posinf=1e5, neginf=-1e5, out=flat)
+                    misc.nan_to_num(flat, nan=0, posinf=1e5, neginf=-1e5, out=flat)  # TODO: make it for v
                     grads = flat.split([param.numel() for param in params])
                     for param, grad in zip(params, grads):
                         param.grad = grad.reshape(param.shape)
@@ -509,47 +612,59 @@ def training_loop(
 
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            images = torch.cat([G_ema(z=z, c=c, noise_mode='random').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg // 1000:06d}.png'), drange=[-1, 1],
-                            grid_size=grid_size)
+            for noise_mode in ['const', 'random', 'none']:
+                images = torch.cat(
+                    [G_ema(z=z, c=c, noise_mode=noise_mode).cpu() for z, c in zip(grid_z, grid_c)]).numpy()
+                save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg // 1000:06d}_{noise_mode}.png'),
+                                drange=[-1, 1],
+                                grid_size=grid_size)
             # Save image projections
             z_mu = []
             z_var = []
             features = []
-            x_fakes = []
-            x_fakes2 = []
+            x_fakes_const = []
+            x_fakes_rand = []
+            x_fakes_var = []
             for real_img1, real_img2, real_c in zip(phase_real_img1, phase_real_img2, phase_real_c):
                 p_label, _ = E.mu_var(real_img1, real_c)
                 p_var = E(real_img1, real_c)
                 z_mu.append(p_label)
                 z_var.append(p_var)
                 feat = G.mapping(p_label, real_c)
-                x_fake = G.synthesis(feat)
                 features.append(feat[:, 0, :])
-                x_fakes.append(x_fake)
+                x_fake = G.synthesis(feat, noise_mode='const')
+                x_fakes_const.append(x_fake)
+                x_fakes_rand.append(G.synthesis(feat, noise_mode='random'))
                 x_fake2 = G(p_var, real_c)
-                x_fakes2.append(x_fake2)
+                x_fakes_var.append(x_fake2)
             z_mu = torch.cat(z_mu, dim=0)
             z_var = torch.cat(z_var, dim=0)
             features = torch.cat(features, dim=0)
-            x_fakes = torch.cat(x_fakes, dim=0)
-            x_fakes2 = torch.cat(x_fakes2, dim=0)
+            x_fakes_const = torch.cat(x_fakes_const, dim=0)
+            x_fakes_rand = torch.cat(x_fakes_rand, dim=0)
+            x_fakes_var = torch.cat(x_fakes_var, dim=0)
             if G.z_dim == 2:
                 phase_real_img1_np = [pri.cpu().numpy() for pri in phase_real_img1]
                 phase_real_img1_np = np.concatenate(phase_real_img1_np, axis=0)
                 projection = scatterBWImages(z_mu.cpu().numpy(), phase_real_img1_np)
-                projection2 = scatterBWImages(z_var.cpu().numpy(), x_fakes2.cpu().numpy())
+                projection2 = scatterBWImages(z_var.cpu().numpy(), x_fakes_var.cpu().numpy())
                 projections = np.concatenate([projection, projection2], axis=1)
                 im = PIL.Image.fromarray(projections)
                 im.save(os.path.join(run_dir, f'projection{cur_nimg // 1000:06d}.png'))
             # Save image in tensorboard
-            img_pair = torch.cat([phase_real_img1[0], x_fakes], dim=2)
-            img_pair = torch.cat([img_pair, img_pair], dim=3)
+            img_pair1 = torch.cat([phase_real_img1[0], x_fakes_const], dim=2)
+            img_pair2 = torch.cat([phase_real_img1[0], x_fakes_rand], dim=2)
+            img_pair = torch.cat([img_pair1, img_pair2], dim=3)
             log.add_embedding(z_mu,
                               metadata=phase_real_c[0],
                               label_img=(phase_real_img1[0] + 1) / 2,
                               global_step=cur_nimg // 1000,
                               tag=f'z_mu/{cur_nimg // 1000:06d}')
+            log.add_embedding(z_mu,
+                              metadata=phase_real_c[0],
+                              label_img=(x_fakes_const + 1) / 2,
+                              global_step=cur_nimg // 1000,
+                              tag=f'z_mu_reconstructed/{cur_nimg // 1000:06d}')
             log.add_embedding(z_var,
                               metadata=phase_real_c[0],
                               label_img=(phase_real_img1[0] + 1) / 2,
@@ -560,6 +675,9 @@ def training_loop(
                               label_img=(img_pair + 1) / 2,
                               global_step=cur_nimg // 1000,
                               tag=f'w/{cur_nimg // 1000:06d}')
+            del z_mu, z_var, features, x_fakes_const, x_fakes_rand, x_fakes_var, img_pair
+            del img_pair1, img_pair2
+            torch.cuda.empty_cache()
 
         # Save network snapshot.
         snapshot_pkl = None
@@ -581,37 +699,82 @@ def training_loop(
                 with open(snapshot_pkl, 'wb') as f:
                     pickle.dump(snapshot_data, f)
 
-            # Evaluate on the evaluation set
-            if validation_set_kwargs:
-                for phase_real_img1, phase_real_img2, phase_real_c in validation_set_loader:
-                    phase_real_img1 = phase_real_img1.to(device).to(torch.float32).split(batch_gpu)
-                    phase_real_img2 = phase_real_img2.to(device).to(torch.float32).split(batch_gpu)
-                    phase_real_c = phase_real_c.to(device).split(batch_gpu)
-                    for real_img1, real_img2, real_c in zip(phase_real_img1, phase_real_img2, phase_real_c):
-                        mu, logvar = E.mu_var(real_img1, None)
-                        recon = G(mu, None).detach()
-                        # Calculate loss
-                        # L_tot = L_G + L_D + L_VAE + L_reg
-                        # L_G = loss_Gmain + loss_Gconstraints + loss_Gpl
-                        gen_logits = loss.run_D([real_img1, recon], [None, None], blur_sigma=0)
-                        loss_Gmain = torch.nn.functional.softplus(-gen_logits)
-                        # L_D = loss_Dreal + loss_Dgen + gradient_penalty
-                        real_logits = loss.run_D([real_img2, real_img1], [None, None], blur_sigma=0)
-                        loss_Dreal = torch.nn.functional.softplus(-real_logits)
-                        loss_Dgen = torch.nn.functional.softplus(gen_logits)
-                        # L_VAE = KLD_loss
-                        KLD_loss = torch.mean(
-                            0.5 * torch.sum(mu ** 2 + torch.exp(logvar) - logvar - 1, 1)) * 0.1
-                        # Lreg = loss_Dr1
-                        loss_tot = loss_Gmain + loss_Dreal + loss_Dgen
+        # --- VALIDATION EVALUATION (No Grad) ---
+        with torch.no_grad():
+            if validation_set_iterator is not None and (
+                    cur_tick == 0 or (cur_nimg + batch_size >= tick_start_nimg + kimg_per_tick * 1000)):
+                v_real_img1, v_real_img2, v_real_c = next(validation_set_iterator)
+                v_real_img1 = v_real_img1.to(device).to(torch.float32).split(batch_gpu)
+                v_real_img2 = v_real_img2.to(device).to(torch.float32).split(batch_gpu)
+                all_mu = []
+                for v_img1, v_img2, v_c in zip(v_real_img1, v_real_img2, v_real_c):
+                    # 1. Encoding
+                    v_mu, v_logvar = E.mu_var(v_img1, None)
+                    all_mu.append(v_mu.cpu())
+                    v_mu2, _ = E.mu_var(v_img2, None)
 
-                        training_stats.report(f'validation_Loss/G/loss', loss_Gmain)
-                        training_stats.report(f'validation_Loss/D/real_loss', loss_Dreal)
-                        training_stats.report(f'validation_Loss/D/gen_loss', loss_Dgen)
-                        training_stats.report(f'validation_Loss/E/KLD_loss', KLD_loss)
-                        training_stats.report(f'validation_Loss/tot_loss', loss_tot)
-                        training_stats.report(f'validation_Loss/scores/real', real_logits)
-                        training_stats.report(f'validation_Loss/scores/fake', gen_logits)
+                    # 2. Reconstruction
+                    v_recon = G(v_mu, None).detach()
+
+                    # 3. L_EG Group
+                    gen_logits = loss.run_D([v_img1, v_recon], [None, None], blur_sigma=0)
+                    loss_Ggan = torch.nn.functional.softplus(-gen_logits).mean()
+                    loss_Grec = (v_img1 - v_recon).abs().mean()
+                    loss_Gvgg = loss.vgg(v_img1, v_recon).mean() if hasattr(loss, 'vgg') else 0.0
+                    kl_weight = getattr(loss, 'kl_weight', 0.1)
+                    KLD_loss = torch.mean(
+                        0.5 * torch.sum(v_mu ** 2 + torch.exp(v_logvar) - v_logvar - 1, 1)) * kl_weight
+                    loss_Gmain = getattr(loss, 'recon_weight', 1.0) * (loss_Grec + loss_Gvgg) + loss_Ggan
+                    L_EG = loss_Gmain + KLD_loss
+
+                    # 4. L_D Group
+                    real_logits = loss.run_D([v_img2, v_img1], [None, None], blur_sigma=0)
+                    loss_Dreal = torch.nn.functional.softplus(-real_logits).mean()
+                    loss_Dgen = torch.nn.functional.softplus(gen_logits).mean()
+                    loss_Dr1 = 0.0
+                    r1_gamma = getattr(loss, 'r1_gamma', 0.0)
+                    if r1_gamma != 0:
+                        with torch.enable_grad():
+                            tmp_real = v_img2.detach().requires_grad_(True)
+                            tmp_logits = loss.run_D([tmp_real, v_img1], [None, None], blur_sigma=0)
+                            r1_grads = \
+                                torch.autograd.grad(outputs=[tmp_logits.sum()], inputs=[tmp_real],
+                                                    create_graph=True,
+                                                    only_inputs=True)[0]
+                            loss_Dr1 = r1_grads.square().sum([1, 2, 3]).mean() * (r1_gamma / 2)
+                    L_D = loss_Dreal + loss_Dgen + loss_Dr1
+
+                    # Report Validation Results
+                    training_stats.report('validation_Loss/EG/L_EG', L_EG)
+                    training_stats.report('validation_Loss/D/L_D', L_D)
+                    training_stats.report('validation_Loss/tot_loss', L_EG + citer * L_D)
+                    if calculate_validation_metrics:
+
+                        if num_gpus > 1:
+                            v_mu_list = [torch.zeros_like(v_mu) for _ in range(num_gpus)]
+                            v_mu2_list = [torch.zeros_like(v_mu2) for _ in range(num_gpus)]
+                            torch.distributed.all_gather(v_mu_list, v_mu)
+                            torch.distributed.all_gather(v_mu2_list, v_mu2)
+                            v_mu = torch.cat(v_mu_list, dim=0)
+                            v_mu2 = torch.cat(v_mu2_list, dim=0)
+
+                        v_ret_metrics = calculate_metrics_at_k_list(v_mu, v_mu2, k_list=[1, 5, 50, 200])
+                        for m_n, m_v in v_ret_metrics.items():
+                            training_stats.report(f'validation_Metrics/{m_n}', m_v)
+
+                        if num_gpus > 1:
+                            del v_mu_list, v_mu2_list
+
+                if (done or cur_tick % network_snapshot_ticks == 0 or break_flag) and stats_tfevents is not None:
+                    stats_tfevents.add_embedding(mat=torch.cat(all_mu), metadata=v_real_c.tolist(),
+                                                 global_step=cur_nimg,
+                                                 tag='z_mu_space')
+
+                del v_real_img1, v_real_img2, v_real_c, all_mu
+
+                if 'v_recon' in locals(): del v_recon
+                if 'gen_logits' in locals(): del gen_logits
+                torch.cuda.empty_cache()
         if break_flag:
             break
 
