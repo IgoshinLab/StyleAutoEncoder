@@ -1,5 +1,7 @@
 # StyleAutoEncoder
 
+[![DOI](https://zenodo.org/badge/795693126.svg)](https://doi.org/10.5281/zenodo.18859733)
+
 Deep learning framework and analysis code for the paper ["Deep Learning Framework for Quantifying Self-Organization in Myxococcus xanthus"](https://doi.org/10.1101/2025.11.07.686839).
 
 Author: Jiangguo Zhang (see project provenance in the repository)
