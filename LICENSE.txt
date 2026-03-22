@@ -1,4 +1,4 @@
-Copyright (c) 2026, Jiangguo Zhang. All rights reserved.
+Copyright (c) 2026, Jiangguo Zhang and co-authors. All rights reserved.
 
 This project is a derivative work based on StyleGAN3 by NVIDIA 
 Corporation.
